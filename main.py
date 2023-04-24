@@ -1,26 +1,71 @@
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import zipfile
 import json
 import glob
 import subprocess
 import websockets
 import asyncio
+from datetime import datetime
+from flask_bcrypt import Bcrypt
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import create_engine
+from flask_jwt_extended import (
+    create_access_token,
+    jwt_required,
+    JWTManager,
+)
+
 
 app = Flask(__name__)
 
+# configure database
+app.config["SQLALCHEMY_DATABASE_URI"] = "postgresql://root:root@localhost/pfe"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
+
+db = SQLAlchemy(app)
+engine = create_engine(app.config["SQLALCHEMY_DATABASE_URI"], echo=True)
+
+# initialize bcrypt
+bcrypt = Bcrypt(app)
+
+jwt = JWTManager(app)
+
+
+# create User model
+class User(db.Model):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now())
+
+    def __init__(self, username, password):
+        self.username = username
+        self.password = bcrypt.generate_password_hash(password).decode("utf-8")
+
+    def check_password(self, password):
+        return bcrypt.check_password_hash(self.password, password)
+
+
+yolov5_dir = os.path.join(os.getcwd(), "yolov5")
+
 
 def set_res_dir():
-    subprocess.run(["cd", "yolov5"], shell=True)
+    if not os.getcwd() == yolov5_dir:
+        print("changing directory to yolov5 2")
+        subprocess.run(["cd", "yolov5"], shell=True)
     # Directory to store results
-    res_dir_count = len(glob.glob("runs/train/*"))
+    res_dir_count = len(glob.glob(yolov5_dir + "/runs/train/*"))
     print(f"Current number of result directories: {res_dir_count}")
     RES_DIR = f"results_{res_dir_count}"
     return RES_DIR
 
 
 async def train_and_output(websocket, EPOCHS, BATCH_SIZE):
-    os.chdir("yolov5")
+    # os.chdir("yolov5")
     if EPOCHS is None:
         EPOCHS = 25
     if BATCH_SIZE is None:
@@ -32,7 +77,7 @@ async def train_and_output(websocket, EPOCHS, BATCH_SIZE):
         "--data",
         "../data.yaml",
         "--weights",
-        "yolov5s.pt",
+        "yolov5m.pt",
         "--img",
         "640",
         "--epochs",
@@ -43,6 +88,8 @@ async def train_and_output(websocket, EPOCHS, BATCH_SIZE):
         RES_DIR,
         "--device",
         "0",
+        "--freeze",
+        "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14",
     ]
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
@@ -96,18 +143,22 @@ def process_zip():
 
 
 @app.route("/detect", methods=["GET"])
+@jwt_required()
 def start_detection():
+    if os.getcwd() == yolov5_dir:
+        print("changing directory to yolov5 1")
+        os.chdir(yolov5_dir)
     # Directory to store inference results.
-    infer_dir_count = len(glob.glob("runs/detect/*"))
+    infer_dir_count = len(glob.glob(yolov5_dir + "/runs/detect/*"))
     print(f"Current number of inference detection directories: {infer_dir_count}")
     INFER_DIR = f"inference_{infer_dir_count+1}"
     # Inference on video stream.
-    subprocess.run(
+    subprocess.Popen(
         [
             "python",
-            "detect.py",
+            yolov5_dir + "/detect.py",
             "--weights",
-            f"runs/train/{RES_DIR}/weights/best.pt",
+            f"{yolov5_dir}/runs/train/{RES_DIR}/weights/best.pt",
             "--source",
             "0",
             "--name",
@@ -119,7 +170,11 @@ def start_detection():
             "0.4",
         ]
     )
-    return f"Detection job started in directory: {INFER_DIR}"
+    mp4_url = f"http://localhost:5000/{INFER_DIR}/0.mp4"
+    return (
+        jsonify({"message": "Detection job started successfully", "mp4_url": mp4_url}),
+        200,
+    )
 
 
 @app.route("/train", methods=["GET"])
@@ -129,6 +184,56 @@ def start_websocket():
         return jsonify({"message": "WebSocket started successfully"}), 200
     except Exception as e:
         return jsonify({"message": f"Error starting WebSocket: {e}"}), 500
+
+
+# @app.route("/reports/<path:path>")
+# def send_report(path):
+#     infer_dir_count = len(glob.glob(yolov5_dir + "/runs/detect/*"))
+#     return send_from_directory(
+#         yolov5_dir + "/runs/detect/" + "ineference_" + infer_dir_count + "0.mp4" , path
+#     )
+
+
+# register endpoint
+@app.route("/register", methods=["POST"])
+def register():
+    username = request.json.get("username")
+    password = request.json.get("password")
+
+    if not username or not password:
+        return jsonify({"msg": "Username and password are required."}), 400
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({"msg": "Username already exists."}), 400
+
+    user = User(username, password)
+    db.session.add(user)
+    db.session.commit()
+
+    return jsonify({"msg": "Registration successful."}), 201
+
+
+# login endpoint
+@app.route("/login", methods=["POST"])
+def login():
+    username = request.json.get("username")
+    password = request.json.get("password")
+
+    user = User.query.filter_by(username=username).first()
+
+    if not user or not user.check_password(password):
+        return jsonify({"msg": "Invalid username or password."}), 401
+
+    access_token = create_access_token(identity=user.id)
+    return jsonify({"access_token": access_token}), 200
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,PUT,POST,DELETE,OPTIONS"
+    return response
 
 
 if __name__ == "__main__":
