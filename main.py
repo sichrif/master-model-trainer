@@ -4,8 +4,7 @@ import zipfile
 import json
 import glob
 import subprocess
-import websockets
-import asyncio
+import threading
 from datetime import datetime
 from flask_bcrypt import Bcrypt
 from flask_sqlalchemy import SQLAlchemy
@@ -62,62 +61,6 @@ def set_res_dir():
     print(f"Current number of result directories: {res_dir_count}")
     RES_DIR = f"results_{res_dir_count}"
     return RES_DIR
-
-
-async def train_and_output(websocket, EPOCHS, BATCH_SIZE):
-    # os.chdir("yolov5")
-    if EPOCHS is None:
-        EPOCHS = 25
-    if BATCH_SIZE is None:
-        BATCH_SIZE = 4
-    print("Sending training updates")
-    command = [
-        "python",
-        "train.py",
-        "--data",
-        "../data.yaml",
-        "--weights",
-        "yolov5m.pt",
-        "--img",
-        "640",
-        "--epochs",
-        str(EPOCHS),
-        "--batch-size",
-        BATCH_SIZE,
-        "--name",
-        RES_DIR,
-        "--device",
-        "0",
-        "--freeze",
-        "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14",
-    ]
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    print("Training started", process)
-
-    # Wait for training to finish
-    while True:
-        try:
-            output = process.stdout.readline()
-            if not output and process.poll() is not None:
-                break
-            message = {"type": "output", "data": output.strip()}
-            await websocket.send(json.dumps(message))
-        except websockets.exceptions.ConnectionClosedError:
-            print("WebSocket connection closed unexpectedly")
-            break
-
-    # Send message to WebSocket when training is done
-    message = f"Training is done! {EPOCHS} epochs were completed in {RES_DIR}."
-    await websocket.send(message)
-
-
-async def main():
-    async with websockets.serve(
-        train_and_output(25, 4), "localhost", 8765, ping_timeout=None
-    ):
-        await asyncio.Future()  # run forever
 
 
 RES_DIR = set_res_dir()
@@ -178,12 +121,57 @@ def start_detection():
 
 
 @app.route("/train", methods=["GET"])
-def start_websocket():
+def start_training():
     try:
-        asyncio.run(main())
-        return jsonify({"message": "WebSocket started successfully"}), 200
+        # Start the training process in a separate thread
+        thread = threading.Thread(target=train_and_output, args=(25, 4))
+        thread.start()
+        return jsonify({"message": "Training started successfully"}), 200
     except Exception as e:
-        return jsonify({"message": f"Error starting WebSocket: {e}"}), 500
+        return jsonify({"message": f"Error starting training: {e}"}), 500
+
+
+def train_and_output(EPOCHS=25, BATCH_SIZE=4):
+    if EPOCHS is None:
+        EPOCHS = 25
+    if BATCH_SIZE is None:
+        BATCH_SIZE = 4
+    print("Starting training")
+    freeze_list = [int(x) for x in "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14".split()]
+    command = [
+        "python",
+        yolov5_dir + "/train.py",
+        "--data",
+        "./data.yaml",
+        "--weights",
+        f"{yolov5_dir}/models/yolov5m.pt",
+        "--img",
+        "640",
+        "--epochs",
+        str(EPOCHS),
+        "--batch-size",
+        str(BATCH_SIZE),
+        "--name",
+        RES_DIR,
+        "--device",
+        "0",
+        "--freeze",
+    ]
+    command.extend(map(str, freeze_list))
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+
+    # Print the output of the subprocess in the console
+    for line in process.stdout:
+        print(line.strip())
+
+    # Wait for training to finish
+    process.communicate()
+
+    # Return response immediately
+    message = f"Training started with {EPOCHS} epochs and {BATCH_SIZE} batch size in {RES_DIR}."
+    return jsonify({"message": message}), 200
 
 
 # @app.route("/reports/<path:path>")
