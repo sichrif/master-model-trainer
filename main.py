@@ -1,7 +1,8 @@
 import os
+import signal
+import uuid
 from flask import Flask, request, jsonify, send_from_directory
 import zipfile
-import json
 import glob
 import subprocess
 import threading
@@ -11,6 +12,7 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import create_engine
 from flask_jwt_extended import (
     create_access_token,
+    get_jwt_identity,
     jwt_required,
     JWTManager,
 )
@@ -19,7 +21,9 @@ from flask_jwt_extended import (
 app = Flask(__name__)
 
 # configure database
-app.config["SQLALCHEMY_DATABASE_URI"] = "postgresql://root:root@localhost/pfe"
+app.config[
+    "SQLALCHEMY_DATABASE_URI"
+] = "postgresql://yolo-user:yolo-password@localhost/yolo-db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 
@@ -36,12 +40,13 @@ jwt = JWTManager(app)
 class User(db.Model):
     __tablename__ = "users"
 
-    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.String(80), primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.now())
 
     def __init__(self, username, password):
+        self.user_id = str(uuid.uuid4())
         self.username = username
         self.password = bcrypt.generate_password_hash(password).decode("utf-8")
 
@@ -49,29 +54,53 @@ class User(db.Model):
         return bcrypt.check_password_hash(self.password, password)
 
 
+# create Model class
+class Model(db.Model):
+    __tablename__ = "models"
+
+    model_id = db.Column(db.String(80), primary_key=True)
+    model_name = db.Column(db.String(80), nullable=False)
+    model_image = db.Column(db.String(150), nullable=True)
+    user_id = db.Column(db.String(80), db.ForeignKey("users.user_id"), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now())
+
+    def __init__(self, model_name, model_image, user_id):
+        self.model_id = str(uuid.uuid4())
+        self.model_name = model_name
+        self.model_image = model_image
+        self.user_id = user_id
+
+
+# create required tables if they don't exist
+with app.app_context():
+    db.create_all()
 yolov5_dir = os.path.join(os.getcwd(), "yolov5")
 
 
-def set_res_dir():
+def set_res_dir(user_id):
     if not os.getcwd() == yolov5_dir:
         print("changing directory to yolov5 2")
         subprocess.run(["cd", "yolov5"], shell=True)
     # Directory to store results
-    res_dir_count = len(glob.glob(yolov5_dir + "/runs/train/*"))
-    print(f"Current number of result directories: {res_dir_count}")
+    res_dir_count = len(glob.glob(yolov5_dir + f"/runs/train/{user_id}/*"))
+    print(f"Current number of result directories for user {user_id}: {res_dir_count}")
     RES_DIR = f"results_{res_dir_count}"
     return RES_DIR
 
 
-RES_DIR = set_res_dir()
-
-
 @app.route("/process", methods=["POST"])
+@jwt_required()
 def process_zip():
+    # Add the new model to the database
+    user_id = get_jwt_identity()
+    model_name = request.form.get("model_name")
+    model_image = request.form.get("model_image")
     # Get the uploaded file
     file = request.files["file"]
-    file.save("data.zip")
+    if not model_name or not file:
+        return jsonify({"message": "File and model name are required."}), 400
 
+    file.save("data.zip")
     # Delete the directories if found
     dirs = ["train", "valid", "test"]
     for dir_name in dirs:
@@ -82,30 +111,45 @@ def process_zip():
         zip_file.extractall()
     # Delete the uploaded file
     os.remove("data.zip")
+    model = Model(model_name, model_image, user_id)
+    db.session.add(model)
+    db.session.commit()
+
     return "Processing complete!"
 
 
 @app.route("/detect", methods=["GET"])
 @jwt_required()
 def start_detection():
+    user_id = get_jwt_identity()
+    model_name = request.args.get("model_name")
     if os.getcwd() == yolov5_dir:
         print("changing directory to yolov5 1")
         os.chdir(yolov5_dir)
     # Directory to store inference results.
-    infer_dir_count = len(glob.glob(yolov5_dir + "/runs/detect/*"))
-    print(f"Current number of inference detection directories: {infer_dir_count}")
+    infer_dir_count = len(
+        glob.glob(yolov5_dir + f"/runs/detect/{user_id}_{model_name}/*")
+    )
+    # Directory to store inference results.
+    results_dir_count = len(
+        glob.glob(yolov5_dir + f"/runs/train/{user_id}/{model_name}/*")
+    )
+    print(
+        f"Current number of inference detection directories for user {user_id} and model {model_name}: {infer_dir_count}"
+    )
     INFER_DIR = f"inference_{infer_dir_count+1}"
+    TRAIN_DIR = f"results_{results_dir_count+1}"
     # Inference on video stream.
-    subprocess.Popen(
+    process = subprocess.Popen(
         [
             "python",
             yolov5_dir + "/detect.py",
             "--weights",
-            f"{yolov5_dir}/runs/train/{RES_DIR}/weights/best.pt",
+            f"{yolov5_dir}/runs/train/{user_id}/{model_name}/{TRAIN_DIR}/weights/best.pt",
             "--source",
             "0",
             "--name",
-            INFER_DIR,
+            f"{user_id}_{model_name}_{INFER_DIR}",
             "--device",
             "0",
             "--save-txt",
@@ -113,31 +157,65 @@ def start_detection():
             "0.4",
         ]
     )
-    mp4_url = f"http://localhost:5000/{INFER_DIR}/0.mp4"
+    process_id = process.pid
+    mp4_url = f"http://localhost:5000/{user_id}_{model_name}_{INFER_DIR}/0.mp4"
     return (
-        jsonify({"message": "Detection job started successfully", "mp4_url": mp4_url}),
+        jsonify(
+            {
+                "message": "Detection job started successfully",
+                "mp4_url": mp4_url,
+                "process_id": process_id,
+            }
+        ),
         200,
     )
 
 
+@app.route("/cancel", methods=["GET"])
+def cancel():
+    process_id = request.args.get("process_id")
+    if not process_id:
+        return jsonify({"message": "Process ID is required."}), 400
+    try:
+        os.kill(process_id, signal.SIGTERM)
+        return jsonify({"message": "Process paused successfully."}), 200
+    except Exception as e:
+        return jsonify({"message": f"Error pausing process: {e}"}), 500
+
+
 @app.route("/train", methods=["GET"])
+@jwt_required()
 def start_training():
+    user_id = get_jwt_identity()
+    model_name = request.args.get("model_name")
+    if not model_name:
+        return (
+            jsonify(
+                {"message": "Model Name is actually required please provide it 😊."}
+            ),
+            400,
+        )
     try:
         # Start the training process in a separate thread
-        thread = threading.Thread(target=train_and_output, args=(25, 4))
+        thread = threading.Thread(
+            target=train_and_output, args=(user_id, 25, 4, model_name)
+        )
         thread.start()
         return jsonify({"message": "Training started successfully"}), 200
     except Exception as e:
         return jsonify({"message": f"Error starting training: {e}"}), 500
 
 
-def train_and_output(EPOCHS=25, BATCH_SIZE=4):
+def train_and_output(user_id, EPOCHS, BATCH_SIZE, model_name):
     if EPOCHS is None:
         EPOCHS = 25
     if BATCH_SIZE is None:
         BATCH_SIZE = 4
-    print("Starting training")
-    freeze_list = [int(x) for x in "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14".split()]
+    print(f"Starting training for user {user_id}")
+    # Directory to store results
+    res_dir_count = len(glob.glob(yolov5_dir + f"/runs/train/{user_id}/*"))
+    print(f"Current number of result directories for user {user_id}: {res_dir_count}")
+    RES_DIR = f"results_{res_dir_count+1}"
     command = [
         "python",
         yolov5_dir + "/train.py",
@@ -152,12 +230,10 @@ def train_and_output(EPOCHS=25, BATCH_SIZE=4):
         "--batch-size",
         str(BATCH_SIZE),
         "--name",
-        RES_DIR,
+        f"{user_id}/{model_name}/{RES_DIR}",
         "--device",
         "0",
-        "--freeze",
     ]
-    command.extend(map(str, freeze_list))
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
@@ -170,16 +246,8 @@ def train_and_output(EPOCHS=25, BATCH_SIZE=4):
     process.communicate()
 
     # Return response immediately
-    message = f"Training started with {EPOCHS} epochs and {BATCH_SIZE} batch size in {RES_DIR}."
+    message = f"Training started with {EPOCHS} epochs and {BATCH_SIZE} batch size for user {user_id} in {RES_DIR}."
     return jsonify({"message": message}), 200
-
-
-# @app.route("/reports/<path:path>")
-# def send_report(path):
-#     infer_dir_count = len(glob.glob(yolov5_dir + "/runs/detect/*"))
-#     return send_from_directory(
-#         yolov5_dir + "/runs/detect/" + "ineference_" + infer_dir_count + "0.mp4" , path
-#     )
 
 
 # register endpoint
@@ -198,7 +266,7 @@ def register():
     db.session.add(user)
     db.session.commit()
 
-    return jsonify({"msg": "Registration successful."}), 201
+    return jsonify({"msg": "Registration successful.", "user_id": user.user_id}), 201
 
 
 # login endpoint
@@ -211,15 +279,31 @@ def login():
 
     if not user or not user.check_password(password):
         return jsonify({"msg": "Invalid username or password."}), 401
+    access_token = create_access_token(identity=user.user_id, expires_delta=False)
+    return jsonify({"access_token": access_token, "user_id": user.user_id}), 200
 
-    access_token = create_access_token(identity=user.id)
-    return jsonify({"access_token": access_token}), 200
+
+@app.route("/models", methods=["GET"])
+@jwt_required()
+def get_models():
+    user_id = get_jwt_identity()
+    if not user_id:
+        return jsonify({"message": "User ID is required."}), 400
+    print("user_id", get_jwt_identity())
+    models = []
+    model_dirs = glob.glob(yolov5_dir + f"/runs/train/{user_id}/*")
+    for model_dir in model_dirs:
+        model_name = os.path.basename(model_dir)
+        models.append(model_name)
+    return jsonify({"models": models}), 200
 
 
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers[
+        "Access-Control-Allow-Headers"
+    ] = "Content-Type,Authorization,user_id"
     response.headers["Access-Control-Allow-Methods"] = "GET,PUT,POST,DELETE,OPTIONS"
     return response
 
