@@ -1,7 +1,8 @@
 import os
+import shutil
 import signal
 import uuid
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, url_for
 import zipfile
 import glob
 import subprocess
@@ -41,14 +42,22 @@ class User(db.Model):
     __tablename__ = "users"
 
     user_id = db.Column(db.String(80), primary_key=True)
+    firstname = db.Column(db.String(80), nullable=True)
+    lastname = db.Column(db.String(80), nullable=True)
+    phonenum = db.Column(db.String(80), nullable=True)
+    email = db.Column(db.String(80), nullable=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.now())
 
-    def __init__(self, username, password):
+    def __init__(self, username, password, firstname, lastname, phonenum, email):
         self.user_id = str(uuid.uuid4())
         self.username = username
         self.password = bcrypt.generate_password_hash(password).decode("utf-8")
+        self.firstname = firstname
+        self.lastname = lastname
+        self.phonenum = phonenum
+        self.email = email
 
     def check_password(self, password):
         return bcrypt.check_password_hash(self.password, password)
@@ -171,6 +180,68 @@ def start_detection():
     )
 
 
+@app.route("/get_training_details", methods=["GET"])
+@jwt_required()
+def get_training_details():
+    user_id = get_jwt_identity()
+    model_id = request.args.get("model_id")
+    if not model_id:
+        return (
+            jsonify({"message": "Model ID is required."}),
+            400,
+        )
+
+    if os.getcwd() == yolov5_dir:
+        print("changing directory to yolov5 1")
+        os.chdir(yolov5_dir)
+
+    # Get the model name from the model ID
+    model = Model.query.filter_by(user_id=user_id, model_id=model_id).first()
+    if not model:
+        return jsonify({"message": "Model not found."}), 404
+
+    model_name = model.model_name
+
+    # Directory to store inference results.
+    results_dir_count = len(
+        glob.glob(yolov5_dir + f"/runs/train/{user_id}/{model_name}/*")
+    )
+    TRAIN_DIR = f"results_{results_dir_count+1}"
+
+    training_dir = os.path.join(
+        yolov5_dir, "runs", "train", user_id, model_name, TRAIN_DIR
+    )
+    print(training_dir)
+    if not os.path.exists(training_dir):
+        return jsonify({"message": "Training directory not found."}), 404
+
+    image_files = glob.glob(os.path.join(training_dir, "*.jpg"))
+
+    # Host the image files and generate URLs
+    image_urls = []
+    for image_file in image_files:
+        filename = os.path.basename(image_file)
+        image_url = url_for(
+            "get_training_image",
+            user_id=user_id,
+            model_name=model_name,
+            train_dir=TRAIN_DIR,
+            filename=filename,
+            _external=True,
+        )
+        image_urls.append(image_url)
+
+    return jsonify({"image_urls": image_urls}), 200
+
+
+@app.route("/get_training_image/<user_id>/<model_name>/<train_dir>/<filename>")
+def get_training_image(user_id, model_name, train_dir, filename):
+    training_dir = os.path.join(
+        yolov5_dir, "runs", "train", user_id, model_name, train_dir
+    )
+    return send_from_directory(training_dir, filename)
+
+
 @app.route("/cancel", methods=["GET"])
 def cancel():
     process_id = request.args.get("process_id")
@@ -255,6 +326,10 @@ def train_and_output(user_id, EPOCHS, BATCH_SIZE, model_name):
 def register():
     username = request.json.get("username")
     password = request.json.get("password")
+    firstname = request.json.get("firstname")
+    lastname = request.json.get("lastname")
+    phonenum = request.json.get("phonenum")
+    email = request.json.get("email")
 
     if not username or not password:
         return jsonify({"msg": "Username and password are required."}), 400
@@ -262,7 +337,7 @@ def register():
     if User.query.filter_by(username=username).first():
         return jsonify({"msg": "Username already exists."}), 400
 
-    user = User(username, password)
+    user = User(username, password, firstname, lastname, phonenum, email)
     db.session.add(user)
     db.session.commit()
 
@@ -289,13 +364,43 @@ def get_models():
     user_id = get_jwt_identity()
     if not user_id:
         return jsonify({"message": "User ID is required."}), 400
-    print("user_id", get_jwt_identity())
-    models = []
-    model_dirs = glob.glob(yolov5_dir + f"/runs/train/{user_id}/*")
-    for model_dir in model_dirs:
-        model_name = os.path.basename(model_dir)
-        models.append(model_name)
-    return jsonify({"models": models}), 200
+
+    models = Model.query.filter_by(user_id=user_id).all()
+    model_list = []
+
+    for model in models:
+        model_name = model.model_name
+        model_id = model.model_id
+        result = {
+            "model_id": model_id,
+            "model_name": model_name,
+        }
+        model_list.append(result)
+
+    return jsonify({"models": model_list}), 200
+
+
+@app.route("/models/<model_id>", methods=["DELETE"])
+@jwt_required()
+def delete_model(model_id):
+    user_id = get_jwt_identity()
+    if not user_id:
+        return jsonify({"message": "User ID is required."}), 400
+
+    # Find the model by model_id and user_id
+    model = Model.query.filter_by(user_id=user_id, model_id=model_id).first()
+    if not model:
+        return jsonify({"message": "Model not found."}), 404
+
+    # Delete the model and related data
+    db.session.delete(model)
+    db.session.commit()
+
+    # Delete the model's training data folder (assuming it's in the "train" directory)
+    train_dir = os.path.join(yolov5_dir, "runs", "train", user_id, model.model_name)
+    shutil.rmtree(train_dir, ignore_errors=True)
+
+    return jsonify({"message": "Model deleted successfully."}), 200
 
 
 @app.after_request
@@ -303,7 +408,7 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers[
         "Access-Control-Allow-Headers"
-    ] = "Content-Type,Authorization,user_id"
+    ] = "Content-Type,Authorization,user_id,model_name"
     response.headers["Access-Control-Allow-Methods"] = "GET,PUT,POST,DELETE,OPTIONS"
     return response
 
